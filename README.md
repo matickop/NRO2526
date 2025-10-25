@@ -1,3 +1,2 @@
-# NRO2526
-
-## Vaja 1
+Matic Koprivnikar  
+23221135
