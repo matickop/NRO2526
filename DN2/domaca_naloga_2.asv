@@ -1,0 +1,234 @@
+function runDN2()
+    % Glavni skript za DN2
+    clc; clear;
+
+    % Nastavi imena datotek (prilagodi dejanskim imenom!)
+    fileNodes   = 'vozlisca_temperature_dn2.txt';  % npr. vozlisca_temperature_dn2_123456.txt
+    fileCells   = 'celice_dn2.txt';                % npr. celice_dn2_123456.txt
+    % Če imaš datoteko velikost_Nx_Ny.txt lahko prebereš tudi od tam; tukaj je podano v nodes datoteki.
+
+    fprintf('--- DN2 zagon ---\n');
+    point = [0.403, 0.503];  % točka iz naloge
+
+    % Naloži podatke
+    data = loadData(fileNodes, fileCells);
+
+    % Izračun z različnimi metodami
+    fprintf('\nInterpolacija v točki (%.3f, %.3f):\n', point(1), point(2));
+
+    % 1) scatteredInterpolant
+    tic;
+    Fs = scatteredInterpolant(data.x, data.y, data.T, 'linear', 'none');
+    T_scattered = Fs(point(1), point(2));
+    t_scattered = toc;
+    fprintf('  scatteredInterpolant: T = %.6f  (čas = %.6f s)\n', T_scattered, t_scattered);
+
+    % 2) griddedInterpolant
+    tic;
+    Fg = griddedInterpolant(data.x_vec, data.y_vec, data.Tmat, 'linear', 'none');
+    T_gridded = Fg(point(1), point(2));
+    t_gridded = toc;
+    fprintf('  griddedInterpolant:   T = %.6f  (čas = %.6f s)\n', T_gridded, t_gridded);
+
+    % 3a) lastna bilinearna (počasnejša – iteracija po celicah)
+    tic;
+    T_bilinear_iter = bilinearInterpolation(point(1), point(2), data);
+    t_bilinear_iter = toc;
+    fprintf('  bilinear iteracija:   T = %.6f  (čas = %.6f s)\n', T_bilinear_iter, t_bilinear_iter);
+
+    % 3b) lastna bilinearna (direkten indeks – hitra)
+    tic;
+    T_bilinear_fast = bilinearDirect(point(1), point(2), data);
+    t_bilinear_fast = toc;
+    fprintf('  bilinear direkten:    T = %.6f  (čas = %.6f s)\n', T_bilinear_fast, t_bilinear_fast);
+
+    % (opcijsko) Najbližji sosed
+    if exist('nearestNeighbor.m','file')
+        tic;
+        T_nn = nearestNeighbor(point(1), point(2), data);
+        t_nn = toc;
+        fprintf('  nearest neighbor:     T = %.6f  (čas = %.6f s)\n', T_nn, t_nn);
+    end
+
+    % Največja temperatura
+    [Tmax, idx] = max(data.T);
+    i = mod(idx-1, data.Nx) + 1;
+    j = floor((idx-1) / data.Nx) + 1;
+    x_max = data.x_vec(i);
+    y_max = data.y_vec(j);
+    fprintf('\nNajvečja temperatura: %.6f pri (x=%.6f, y=%.6f)\n', Tmax, x_max, y_max);
+
+    fprintf('\n--- Konec ---\n');
+end
+
+function data = loadData(fileNodes, fileCells)
+% loadData Prebere podatke o vozliščih in (opcijsko) celicah.
+% Struktura datoteke vozlišč:
+% 1: header "x,y,T"
+% 2: "st. koordinat v x-smeri: Nx"
+% 3: "st. koordinat v y-smeri: Ny"
+% 4: "st. vseh vozlisc: Nv"
+% 5+: x,y,T podatki
+%
+% Datoteka celic:
+% 1: header stolpcev
+% 2: "st. celic: Nc"
+% 3+: indeksi točk (pt1,pt2,pt3,pt4) v CCW vrstnem redu.
+
+    if ~isfile(fileNodes)
+        error('Datoteka %s ne obstaja.', fileNodes);
+    end
+    fid = fopen(fileNodes,'r');
+    if fid < 0, error('Ne morem odpreti %s', fileNodes); end
+
+    % Preberi meta vrstice
+    header1 = strtrim(fgetl(fid)); %#ok<NASGU>
+    line2 = strtrim(fgetl(fid));
+    line3 = strtrim(fgetl(fid));
+    line4 = strtrim(fgetl(fid));
+
+    Nx = parseNumber(line2);
+    Ny = parseNumber(line3);
+    Nv = parseNumber(line4);
+
+    raw = textscan(fid, '%f%f%f', 'Delimiter', ',', 'CollectOutput', true);
+    fclose(fid);
+
+    if numel(raw) < 1
+        error('Napaka pri branju numeričnih podatkov iz %s', fileNodes);
+    end
+    M = raw{1};
+    if size(M,1) ~= Nv
+        warning('Prebrano število vrstic (%d) se ne ujema z Nv (%d).', size(M,1), Nv);
+    end
+
+    x = M(:,1);
+    y = M(:,2);
+    T = M(:,3);
+
+    % Predpostavka: podatki so urejeni po vrsticah y (vsak y ima Nx vrednosti x)
+    % Reshape v matriko T(x_i, y_j)
+    if mod(numel(T), Nx) ~= 0 || (numel(T)/Nx) ~= Ny
+        error('Dimenzije ne ustrezajo Nx, Ny. Preveri datoteko.');
+    end
+    Tmat = reshape(T, Nx, Ny);  % velikost Nx × Ny
+
+    % Vektorja x in y:
+    x_vec = x(1:Nx);
+    y_vec = y(1:Nx:end);
+
+    % (opcijsko) celice
+    cells = [];
+    Nc = (Nx-1)*(Ny-1);
+    if nargin >= 2 && ~isempty(fileCells)
+        if isfile(fileCells)
+            fidc = fopen(fileCells,'r');
+            headerCells = strtrim(fgetl(fidc)); %#ok<NASGU>
+            lineNc = strtrim(fgetl(fidc));
+            Nc_file = parseNumber(lineNc);
+            C = textscan(fidc, '%d%d%d%d', 'Delimiter', ',', 'CollectOutput', true);
+            fclose(fidc);
+            cells = C{1};
+            if size(cells,1) ~= Nc_file
+                warning('Prebranih celic (%d) != deklariranih (%d).', size(cells,1), Nc_file);
+            end
+        else
+            warning('Datoteka celic %s ne obstaja. Nadaljujem brez celic.', fileCells);
+        end
+    end
+
+    data.x = x;
+    data.y = y;
+    data.T = T;
+    data.Tmat = Tmat;
+    data.x_vec = x_vec;
+    data.y_vec = y_vec;
+    data.Nx = Nx;
+    data.Ny = Ny;
+    data.Nv = Nv;
+    data.dx = x_vec(2)-x_vec(1);
+    data.dy = y_vec(2)-y_vec(1);
+    data.cells = cells;
+    data.Nc = Nc;
+end
+
+function val = parseNumber(line)
+    % Izvleče prvo število iz vrstice
+    toks = regexp(line, '([-+]?\d+\.?\d*)', 'match');
+    if isempty(toks)
+        error('Ni številčne vrednosti v vrstici: %s', line);
+    end
+    val = str2double(toks{1});
+end
+
+function Tb = bilinearInterpolation(xq, yq, data)
+% bilinearInterpolation Počasnejši pristop: iterira čez celice in poišče,
+% v kateri celici se nahaja (xq,yq), nato izvede bilinearno interpolacijo.
+%
+% CELICE: data.cells (pt1, pt2, pt3, pt4) v CCW: spodaj-levo, spodaj-desno,
+% zgoraj-desno, zgoraj-levo
+%
+% OPOMBA: Za veliko mrežo (milijoni celic) je to zelo počasno in samo
+% pokazano zaradi didaktike. Raje uporabi bilinearDirect.
+
+    if isempty(data.cells)
+        % Če nimamo datoteke celic, lahko sami afinitetno računamo:
+        % a) Pretvori to v direktni način (uporabi bilinearDirect)
+        warning('Ni podatkov o celicah. Uporabi bilinearDirect namesto iteracije.');
+        Tb = bilinearDirect(xq, yq, data);
+        return;
+    end
+
+    Nx = data.Nx;
+    Ny = data.Ny;
+    x_vec = data.x_vec;
+    y_vec = data.y_vec;
+    Tmat = data.Tmat;
+
+    % Hitro preveri robove:
+    if xq < x_vec(1) || xq > x_vec(end) || yq < y_vec(1) || yq > y_vec(end)
+        Tb = NaN;
+        return;
+    end
+
+    cells = data.cells;
+    % Iteracija po celicah (počasno!)
+    for c = 1:size(cells,1)
+        ids = cells(c,:);
+        % Vozlišča:
+        % spodaj-levo = ids(1)
+        % spodaj-desno = ids(2)
+        % zgoraj-desno = ids(3)
+        % zgoraj-levo = ids(4)
+
+        [i1,j1] = nodeIndex(ids(1), Nx);
+        [i2,j2] = nodeIndex(ids(2), Nx);
+        [i3,j3] = nodeIndex(ids(3), Nx);
+        [i4,j4] = nodeIndex(ids(4), Nx);
+
+        xmin = x_vec(i1); xmax = x_vec(i2);
+        ymin = y_vec(j1); ymax = y_vec(j4);
+
+        if xq >= xmin && xq <= xmax && yq >= ymin && yq <= ymax
+            % V tej celici izvedi bilinearno interpolacijo
+            T11 = Tmat(i1,j1); % spodaj-levo
+            T21 = Tmat(i2,j2); % spodaj-desno
+            T22 = Tmat(i3,j3); % zgoraj-desno
+            T12 = Tmat(i4,j4); % zgoraj-levo
+
+            K1 = (xmax - xq)/(xmax - xmin) * T11 + (xq - xmin)/(xmax - xmin) * T21;
+            K2 = (xmax - xq)/(xmax - xmin) * T12 + (xq - xmin)/(xmax - xmin) * T22;
+            Tb = (ymax - yq)/(ymax - ymin) * K1 + (yq - ymin)/(ymax - ymin) * K2;
+            return;
+        end
+    end
+
+    % Če ne najde celice:
+    Tb = NaN;
+end
+
+function [i,j] = nodeIndex(id, Nx)
+    % Pretvori globalni ID (1-based) v (i,j)
+    i = mod(id-1, Nx) + 1;
+    j = floor((id-1)/Nx) + 1;
+end
